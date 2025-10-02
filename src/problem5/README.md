@@ -89,55 +89,37 @@ Health check:
 
 ### Screenshots / Examples
 
-Below sections reserved for screenshots you will capture (e.g. from Postman / curl output). Replace the placeholder image markdown with real images later.
+Below sections reserved for screenshots you will capture from Swagger UI
 
 #### 1. Health Check
 
-> Add an image (e.g. Postman or terminal) showing a 200 response.
-
-```
-![Health Check](docs/images/health-check.png)
-```
+![Health Check](src/assets/images/health-check.png)
+![Health Check](src/assets/images/health-check-terminal.png)
 
 #### 2. List Books
 
-> Add image of GET /books with query parameters and sample paginated response.
-
-```
-![List Books](docs/images/list-books.png)
-```
+![List Books](src/assets/images/list-books.png)
+![List Books](src/assets/images/list-books-db.png)
 
 #### 3. Create a Book
 
-> Add image showing POST /books request body and 201 response.
-
-```
-![Create Book](docs/images/create-book.png)
-```
+![Create Book](src/assets/images/create-a-book.png)
+![Create Book](src/assets/images/create-a-book-db.png)
 
 #### 4. Get Book By ID
 
-> Add image for GET /books/:id returning a single book object.
-
-```
-![Get Book](docs/images/get-book.png)
-```
+![Get Book](src/assets/images/get-book-by-id.png)
+![Get Book](src/assets/images/get-book-by-id-db.png)
 
 #### 5. Update Book
 
-> Add image for PUT /books/:id with updated fields and 200 response.
-
-```
-![Update Book](docs/images/update-book.png)
-```
+![Update Book](src/assets/images/update-book.png)
+![Update Book](src/assets/images/update-book-db.png)
 
 #### 6. Delete Book
 
-> Add image of DELETE /books/:id returning 204 status.
-
-```
-![Delete Book](docs/images/delete-book.png)
-```
+![Delete Book](src/assets/images/delete-book.png)
+![Delete Book](src/assets/images/delete-book-db.png)
 
 ### Create Book
 
@@ -285,14 +267,3 @@ You can then import `openapi.json` into tools like Postman, Insomnia, or Stoplig
 
 - Prisma client generation happens automatically on install; run `npx prisma generate` if schema changes.
 - Use `DATABASE_URL` to point to a different Postgres instance (e.g. Docker container).
-
-## Future Enhancements (Ideas)
-
-- JWT auth / users
-- Soft deletes
-- Sorting options
-- OpenAPI (Swagger) docs
-
----
-
-MIT License
