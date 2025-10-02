@@ -1,315 +1,439 @@
-# Scoreboard Update API - Specification
+# Realtime Leaderboard Module Specification
 
-## Overview
+## 1. Overview
 
-This module handles updates to user scores and provides a live-updating scoreboard (top 10 users). It is a backend API service intended to be used by the website frontend and other internal services. The module must ensure integrity of score updates, prevent unauthorized or malicious increments, and deliver near real-time updates to connected clients.
+A backend service module that maintains and serves a realtime leaderboard of the top 10 user scores for display on a public (or semi-public) website. Users perform an abstract **Action** (business-defined elsewhere) that results in an increment to their score. The system must:
 
-Primary responsibilities:
+- Persist user scores reliably.
+- Update the global top 10 ranking with low latency (< 1s target P50, < 2s P95 end-to-end from action completion to UI update).
+- Defend against fraudulent score inflation attempts.
+- Scale horizontally under bursty write loads.
 
-- Accept score update requests (from frontend after user completes an action).
-- Validate authorization and request integrity.
-- Atomically update persistent store (leaderboard data).
-- Publish changes to a real-time delivery layer (WebSocket / Server-Sent Events) so the scoreboard UI updates live.
+## 2. Goals
 
-This README documents the API contract, data shapes, sequence diagrams, security considerations, implementation guidance, edge cases and suggested improvements.
+- Provide consistent, fast read access to top 10 scores.
+- Support high write throughput (score increment events).
+- Realtime push updates to connected clients when leaderboard changes.
+- Strong security controls to prevent unauthorized score changes.
+- Observability for correctness and performance.
 
-## Small contract (inputs / outputs / error modes)
+## 3. Non-Goals
 
-- Inputs: authenticated request with user identity and score delta; optional action metadata.
-- Outputs: success/failure JSON; realtime notification broadcasts (top10 snapshot or diff).
-- Error modes: invalid auth (401), malformed payload (400), rate limit or abuse (429), server error (500). On partial failure, the server must not send live updates.
+- Implementing the user Action itself (business logic outside scope).
+- Long-term analytics or historical trend visualization (can be future work).
+- Complex matchmaking/game session semantics.
+- Providing a full user profile service (only score-related data needed here).
 
-## Endpoints
+## 4. Key Requirements Mapping
 
-1. GET /api/scoreboard/top10
+| Requirement                 | Spec Section                                         |
+| --------------------------- | ---------------------------------------------------- |
+| Show top 10 scores          | API: `GET /leaderboard/top` & Data Model & Caching   |
+| Live update scoreboard      | Realtime Updates (WebSocket/SSE) & Pub/Sub Flow      |
+| Increment score via action  | `POST /score-events` endpoint & Processing Pipeline  |
+| Secure score increases      | Security & Anti-Abuse sections                       |
+| Prevent malicious tampering | Signed Action Tokens, Rate Limits, Anomaly Detection |
 
-- Description: Returns the current top 10 users (scoreboard snapshot).
-- Auth: Optional read-only token for public scoreboard. Rate-limit per IP.
-- Response 200:
+## 5. High-Level Architecture
 
-  {
-  "ranking": [
-  {"rank":1, "userId":"u_123", "displayName":"Alice", "score":12345},
-  ... up to 10 items
-  ],
-  "generatedAt": "2025-10-01T12:00:00Z"
-  }
+Components:
 
-2. POST /api/score/update
+1. **API Gateway / Edge** – Auth, rate limiting, WAF.
+2. **Leaderboard Service** – Core module (this spec): REST + WebSocket/SSE endpoint, business validation.
+3. **Score Processor** – Idempotent consumer applying ScoreEvents (could be same service for MVP or separated into background worker for scaling).
+4. **Datastores**:
+   - Primary DB (e.g., PostgreSQL) for authoritative `user_scores` & immutable `score_events` audit log.
+   - Redis (or Elasticache / KeyDB) for realtime leaderboard sorted set and user score cache.
+5. **Pub/Sub Bus** (e.g., Redis Pub/Sub, NATS, or Kafka) for broadcasting leaderboard delta events to web tier.
+6. **Realtime Gateway** – Manages WebSocket/SSE fan-out to clients; subscribes to leaderboard change topics.
+7. **Security & Anti-Fraud Subsystems** – Token verification, rate limiting, anomaly heuristics, optional ML pipeline (future).
+8. **Observability Stack** – Metrics (Prometheus), Logs (structured), Traces (OpenTelemetry).
 
-- Description: Accepts a request to increment a user's score after completing an action.
-- Auth: Required (see Security). Caller must authenticate as the user or as a trusted action-service on behalf of the user.
-- Payload (application/json):
+### Data Flow Summary
 
-  {
-  "userId": "u_123",
-  "delta": 10,
-  "actionId": "action-789", // optional, to dedupe
-  "timestamp": "2025-10-01T12:00:00Z",
-  "signature": "..." // optional HMAC when delegated
-  }
+Action Completed -> Client obtains Signed Action Token -> `POST /score-events` -> Validation -> Persist event & update user score (DB Tx) -> Update Redis sorted set -> If leaderboard changed OR user's presence in top 10 changed -> Publish `leaderboard.update` -> Realtime gateway pushes to subscribed clients -> UI updates scoreboard.
 
-- Responses:
-  - 200 OK {"ok":true, "newScore": 12355}
-  - 400 Bad Request {"error":"invalid_payload"}
-  - 401 Unauthorized {"error":"unauthorized"}
-  - 429 Too Many Requests {"error":"rate_limited"}
-  - 500 Internal Error {"error":"server_error"}
+## 6. Data Model
 
-3. WebSocket /ws/scoreboard (or SSE at /sse/scoreboard)
+### Entities
 
-- Description: Real-time stream for scoreboard updates. Clients should subscribe and display the top 10 live.
-- Auth: Optional token for private boards; public boards can allow anonymous with stricter rate limits.
-- Events:
-  - "snapshot": full top10 payload (same shape as GET /top10)
-  - "update": incremental change {"userId":"u_123","oldRank":2,"newRank":1,"oldScore":12000,"newScore":12010}
-  - "heartbeat": keep-alive
+- `User` (external system authoritative; minimal fields mirrored locally):
+  - `id` (UUID or ULID)
+  - `display_name` (optional cache)
+- `ScoreEvent` (append-only):
+  - `id` (ULID for time-ordered uniqueness)
+  - `user_id`
+  - `delta` (int > 0)
+  - `action_type` (string enum; optional; aids anomaly detection)
+  - `signature_id` / `action_token_id` (for traceability)
+  - `created_at` (timestamp)
+  - `ingested_at` (timestamp)
+  - `client_metadata` (JSONB: ip_hash, device_id, app_version)
+- `UserScore` (current aggregate):
+  - `user_id` (PK, FK)
+  - `score` (bigint, default 0)
+  - `updated_at`
 
-Recommendation: Use a small message schema and send occasional full snapshots to avoid client drift.
+### Relational Schema (PostgreSQL-esque)
 
-## Data model and storage
+```sql
+CREATE TABLE user_scores (
+  user_id UUID PRIMARY KEY,
+  score BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-Persistent store options (pick one based on scale):
+CREATE TABLE score_events (
+  id TEXT PRIMARY KEY, -- ULID
+  user_id UUID NOT NULL REFERENCES user_scores(user_id),
+  delta INT NOT NULL CHECK (delta > 0 AND delta < 1000000),
+  action_type TEXT NOT NULL,
+  action_token_id TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  client_metadata JSONB
+);
 
-- Postgres with an indexed scores table (user_id primary, score numeric) and a materialized view for top10.
-- Redis Sorted Set (ZSET) to maintain an in-memory leaderboard for fast reads and atomic increments.
-
-Suggested hybrid approach (recommended):
-
-- Primary write in Postgres (authoritative). Also perform an atomic update in Redis ZSET for low-latency reads.
-- Periodic reconciliation/sync from Postgres -> Redis to fix drift.
-
-Table example (Postgres):
-
-users_scores (
-user_id varchar primary key,
-score bigint not null default 0,
-updated_at timestamptz not null default now()
-)
-
-Redis: ZADD leaderboard score userId (use ZINCRBY for deltas)
-
-Atomicity: Use DB transactions and/or Redis scripts (LUA) to ensure consistency when applying deltas and checking dedupe/actionId.
-
-## Real-time flow and pub/sub
-
-- When a score update is accepted and persisted, the service publishes a message to a pub/sub channel (Redis Pub/Sub, Redis Streams, Kafka, or a message broker).
-- A real-time broadcaster process (or separate horizontally-scalable service) subscribes and broadcasts to connected WebSocket clients.
-- Alternatively, the API workers can directly publish to connected WebSocket nodes via a shared channel (Redis) so the routing is stateless.
-
-## Sequence Diagram (flow of execution)
-
-Use the following mermaid sequence diagram to illustrate the typical flow from action completion to live scoreboard update.
-
-```mermaid
-sequenceDiagram
-	autonumber
-	participant Browser
-	participant Frontend
-	participant API
-	participant Auth as AuthService
-	participant DB as Postgres
-	participant Redis as RedisZSET
-	participant Bus as Broker
-	participant WS as WebSocketSrv
-
-	Browser->>Frontend: User completes action
-	Frontend->>API: POST /api/score/update
-	API->>Auth: Validate token/signature
-	Auth-->>API: OK
-
-	API->>DB: BEGIN tx
-	API->>DB: Check actionId
-	DB-->>API: new / duplicate?
-	alt New action
-		API->>DB: UPSERT score (+delta)
-	else Duplicate action
-		API-->>Frontend: 200 OK (idempotent)
-		note over API,Frontend: No publish for duplicate
-		API->>DB: COMMIT (no-op)
-		API->>DB: (tx ends)
-		Frontend-->>Browser: Display unchanged scoreboard
-		note over API,DB: Path ends here
-	end
-	API->>DB: COMMIT
-
-	API->>Redis: ZINCRBY leaderboard delta
-	API->>Bus: publish score.updated
-	Bus-->>WS: fan-out event
-	WS->>Browser: push update
-	Browser-->>Frontend: Re-render scoreboard
-
-	alt DB failure
-		API-->>Frontend: 500 error
-	end
-
-	note over API,Redis: Cache failure tolerated; recovery job later
+CREATE INDEX idx_score_events_user_created ON score_events(user_id, created_at DESC);
+CREATE INDEX idx_score_events_created ON score_events(created_at);
 ```
 
-## Architecture overview diagram
+### Caching / Leaderboard Structure
 
-The following mermaid diagram shows the high-level components and the flow between them.
+Redis Sorted Set: `leaderboard:global` with `score` as the ZSET score and `user_id` as member.
+
+- Additional key: `user:score:{user_id}` (string or hash) for quick lookups; TTL optional (or persistent, updated on writes).
+- Maintain a cached snapshot JSON: `leaderboard:top10:json` (with ETag/version) for ultra-fast GET.
+- Version key: `leaderboard:version` (incremented on each material change to top 10 ordering or membership).
+
+### Consistency
+
+- DB is source of truth; Redis is a **write-through cache**.
+- Score updates in a DB transaction followed by Redis update (with retry & reconciliation job).
+- Periodic reconciliation (cron) recomputes top 10 from DB to detect divergence.
+
+## 7. API Design
+
+All responses use JSON. Errors return problem+json style.
+
+### 7.1 Authentication
+
+- Bearer JWT (user identity) from upstream identity provider.
+- `POST /score-events` additionally requires a short-lived (<=30s) **Signed Action Token** header: `X-Action-Token`.
+
+### 7.2 Endpoints
+
+1. `GET /leaderboard/top`
+
+   - Description: Returns top 10 users with scores and version.
+   - Query Params: `ifNoneMatch` via HTTP `If-None-Match` header for caching.
+   - Response 200:
+     ```json
+     {
+       "version": 1234,
+       "generated_at": "2025-10-03T12:00:00Z",
+       "entries": [
+         {"rank":1, "user_id":"...", "score":12345, "display_name":"Alice"},
+         ... up to 10
+       ]
+     }
+     ```
+   - 304 if unchanged.
+
+2. `GET /users/{id}/score`
+
+   - Desc: Returns a user's current score.
+   - Response 200:
+     ```json
+     { "user_id": "...", "score": 12345, "updated_at": "2025-10-03T12:00:00Z" }
+     ```
+   - 404 if user unknown.
+
+3. `POST /score-events`
+   - Desc: Submit a score increment event.
+   - Headers: `Authorization: Bearer <JWT>`, `X-Action-Token: <opaque>`
+   - Body:
+     ```json
+     {
+       "delta": 25,
+       "action_type": "level_complete",
+       "client_metadata": { "device_id": "hash123" }
+     }
+     ```
+   - Idempotency Key (recommended) via `Idempotency-Key` header referencing action token id.
+   - Response 202 (async) or 200 (sync) depending on mode:
+     ```json
+     {
+       "event_id": "01H...",
+       "new_score": 12400,
+       "user_id": "...",
+       "leaderboard_changed": true
+     }
+     ```
+   - Errors: 400 (validation), 401 (unauth), 403 (invalid token), 409 (duplicate), 429 (rate limit), 422 (suspicious flagged), 500.
+
+### 7.3 Realtime Channel
+
+- WebSocket endpoint: `wss://api.example.com/realtime` or SSE: `GET /leaderboard/stream` (choose one; both documented for flexibility).
+- Client subscribes to `leaderboard.global.top10`.
+- Message (on change only):
+  ```json
+  {
+    "type":"leaderboard.update",
+    "version":1235,
+    "diff": {
+      "removed": ["user_id_old"],
+      "added": [{"rank":7,"user_id":"...","score":9000}],
+      "moved": [{"user_id":"...","old_rank":5,"new_rank":3}]
+    },
+    "full": {"entries":[ ... top 10 ... ]}
+  }
+  ```
+- Heartbeat every 25s: `{ "type": "ping", "ts": 1696345234 }`
+- Close codes: 4001 (auth), 4009 (rate limited), 4010 (protocol error).
+
+## 8. Processing & Update Flow
+
+1. Client completes Action -> obtains Signed Action Token (SAT) from separate Action Service (proof-of-action: includes user_id, action_type, nonce, exp, HMAC).
+2. Client calls `POST /score-events` with SAT & JWT.
+3. Service validates JWT, SAT signature, expiry, nonce uniqueness.
+4. Begin DB transaction:
+   - Upsert row in `user_scores` if absent (initial score 0).
+   - Insert `score_events` (id = ULID or derived from SAT nonce for idempotency).
+   - Update `user_scores.score = score + delta`.
+5. Commit.
+6. Update Redis: `ZADD leaderboard:global <score> <user_id>` & set `user:score:{id}`.
+7. Retrieve new top 10; compare with cached snapshot. If changed:
+   - Increment `leaderboard:version`.
+   - Publish `leaderboard.update` with diff payload.
+   - Update `leaderboard:top10:json`.
+8. Realtime gateway pushes to clients.
+9. (Async) Anomaly heuristics evaluated; potential flag triggers additional monitoring.
+
+## 9. Security & Anti-Abuse
+
+| Aspect              | Mechanism                                                                                                                          |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication      | JWT (aud, iss, exp validated)                                                                                                      |
+| Action authenticity | Signed Action Token (HMAC or ECDSA) containing user_id, action_type, nonce, exp, delta_cap. Server recomputes & verifies.          |
+| Authorization       | Ensure JWT.sub == SAT.user_id; enforce per-action delta <= SAT.delta_cap.                                                          |
+| Idempotency         | SAT.nonce or `Idempotency-Key` stored in Redis set: `scoreevent:nonce:{nonce}` with TTL to prevent replay.                         |
+| Rate Limiting       | Token bucket at user + IP (e.g., 60 score events/min). Edge + service-level.                                                       |
+| Input Validation    | `delta` integer bounds, action_type enumeration.                                                                                   |
+| Anomaly Detection   | Heuristics: z-score of deltas/time; sudden large jumps; device diversity; per-hour cap. Flag -> throttle or require manual review. |
+| Transport Security  | TLS 1.2+; HSTS.                                                                                                                    |
+| Replay Protection   | Nonce uniqueness, short SAT expiry (<30s).                                                                                         |
+| Logging & Audit     | Immutable score_events table; structured logs with correlation IDs.                                                                |
+| Secret Management   | Keys rotated via KMS; maintain key version in SAT header `kid`.                                                                    |
+
+### Signed Action Token Format (Example JWT-like but internal)
+
+Header: `{ "alg":"HS256", "typ":"SAT", "kid":"v3" }`
+Payload:
+
+```json
+{
+  "sub": "<user_id>",
+  "act": "level_complete",
+  "nonce": "01HABCDXYZ...",
+  "delta_cap": 50,
+  "exp": 1696345234
+}
+```
+
+Signature: `HMACSHA256(base64url(header).".".base64url(payload), secret_kid)`. Service verifies and ensures submitted delta <= delta_cap.
+
+## 10. Performance & Scaling
+
+- Writes: Batch-friendly; option to push events to a queue (Kafka/NATS) and process asynch for smoothing. For MVP, synchronous path fine until ~1-2k writes/sec.
+- Reads: Top 10 is O(1) Redis fetch. Cache full JSON to minimize repeated JSON assembly.
+- Hot Keys: Top 10 key heavily read; enable Redis replication & client-side caching with ETag.
+- Horizontal Scaling: Stateless API nodes; shared Redis & DB. Use consistent hashing / sharding if user base grows (shard sorted sets per region, aggregate).
+- Backpressure: If DB latency spikes, optionally degrade to queue ingestion (return 202 and process later). Provide feature flag.
+- Recovery: Warm rebuild Redis from DB via `SELECT user_id, score FROM user_scores` + `ZADD` at startup or maintenance job.
+
+## 11. Failure Modes & Mitigations
+
+| Failure                | Impact                                  | Mitigation                                                                                                                  |
+| ---------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Redis outage           | No realtime updates / stale leaderboard | Serve last known snapshot; switch to DB fallback query (LIMIT 10 ORDER BY score DESC) with higher latency; circuit breaker. |
+| DB outage              | Cannot persist events                   | Return 503; optionally enqueue events to durable queue and apply later (with replay idempotency).                           |
+| Pub/Sub lag            | Delayed UI updates                      | Heartbeat & version polling fallback (clients poll `/leaderboard/top?sinceVersion=x`).                                      |
+| Replay attack attempts | Fraudulent increments                   | Nonce store + anomaly heuristics; 403 + alert.                                                                              |
+| Clock skew client      | SAT invalid prematurely                 | Allow small leeway (±5s) & log skew metrics.                                                                                |
+
+## 12. Observability
+
+Metrics (Prometheus):
+
+- `score_event_ingest_latency_ms` (p50/p95/p99)
+- `score_event_db_tx_duration_ms`
+- `leaderboard_top10_changed_total`
+- `leaderboard_realtime_connections` (gauge)
+- `score_event_deltas_sum` & count per action_type
+- `suspicious_events_total`
+- `redis_leaderboard_update_errors_total`
+
+Logs:
+
+- Structured JSON; include fields: trace_id, user_id, event_id, sat_nonce, delta, anomaly_flags.
+
+Tracing:
+
+- Span chain: HTTP ingest -> validation -> DB tx -> Redis update -> publish.
+
+Alerts:
+
+- No leaderboard update in > 10m (if event volume > threshold).
+- Redis error rate > 1% over 5m.
+- DB tx p95 > 500ms.
+- Suspicious events spike > 3x baseline.
+
+SLOs:
+
+- 99% of score events processed & broadcast within 2s.
+- Leaderboard availability (read top 10) 99.95% monthly.
+
+## 13. Reconciliation & Maintenance
+
+- Nightly job: recompute top 10 & compare hash; alert on mismatch.
+- Drift repair script: rebuild Redis ZSET from DB snapshot.
+- TTL cleanup: remove old nonce keys.
+
+## 14. Deployment & Config
+
+Environment variables:
+
+- `DB_URL`, `REDIS_URL`, `ACTION_TOKEN_HMAC_KEYS` (JSON map kid->base64 secret), `RATE_LIMIT_SCORE_EVENTS_PER_MIN`, `FEATURE_ASYNC_PIPELINE`.
+
+Rollouts:
+
+- Canary: Compare rate of anomalies & latency vs baseline.
+- Key Rotation: Add new `kid`, dual-sign until old retired.
+
+## 15. Security Review Considerations
+
+- Ensure no direct client-provided score value (only delta, capped).
+- Protect against integer overflow (use BIGINT; enforce upper score limit if necessary, e.g. < 9e15).
+- Validate JSON sizes (limit body to e.g. 1 KB for events).
+- Pen-test scenarios: replay, mass small deltas (spam), crafted SAT with expired kid, high-concurrency race increments.
+
+## 16. Future Improvements / TODO
+
+- Regional leaderboards & segmentation (e.g., country, league). Add additional Redis ZSET namespaces.
+- Historical snapshots for trending (hourly rollups table or time-series DB).
+- ML-based fraud scoring (feature extraction pipeline on score_events).
+- gRPC ingestion path for internal services.
+- WebAssembly plugin sandbox for custom scoring modifiers.
+- Adaptive rate limiting (dynamic thresholds).
+- Push compression (permessage-deflate) & delta-encoding (only send changed ranks minimal form).
+- GraphQL subscription wrapper.
+
+## 17. Diagram: Component & Flow
 
 ```mermaid
 flowchart LR
-    subgraph Client
-        B[Browser]
-        FE[Frontend App]
-    end
-
-    subgraph Core
-        API[API Service]
-        AUTH[Auth Service]
-        DB[(Postgres)]
-    end
-
-    subgraph Realtime
-        R[(Redis ZSET)]
-        BR[(Kafka/Streams)]
-        WS[WebSocket Cluster]
-    end
-
-    B --> FE --> API
-    API --> AUTH
-    API --> DB
-    DB --> R
-    API --> R
-    API --> BR
-    BR --> WS
-    R -. optional pub/sub .- WS
-    WS --> B
-
-    classDef optional fill=#FFF6E5,stroke=#E6B800,stroke-width=1px
-    class BR optional
-
-    %% Broker (BR) is optional if Redis pub/sub used directly.
+  A[Client Browser] -- Action Token Request --> B[Action Service]
+  B -- Signed Action Token --> A
+  A -- POST /score-events (JWT + SAT) --> C[Leaderboard API]
+  C -->|Validate & Tx| D[(PostgreSQL)]
+  C -->|Update ZSET| E[(Redis)]
+  C -->|Publish diff| F[(Pub/Sub)]
+  F --> G[Realtime Gateway]
+  E --> C
+  G -->|WS/SSE update| A
+  subgraph Reconciliation
+    H[Periodic Job] --> D
+    H --> E
+  end
 ```
 
-## Extra improvement and implementation notes
+## 18. Diagram: Sequence (Score Event)
 
-- Provide an OpenAPI (Swagger) definition and generate client SDKs for frontend to reduce integration bugs.
-- Consider using Redis Streams or Kafka if you want durable event storage and replay for debugging and rebuilding leaderboards.
-- For ultimate security, move the action validation fully server-side: the frontend only receives a short-lived claim and cannot craft deltas.
-- Consider differential broadcasts: if many users are connected, broadcast only rank changes and relevant slice (e.g., top 10) to reduce bandwidth.
-- For multi-region deployments, use a global message bus or replicate leaderboards per region and reconcile periodically.
+```mermaid
+sequenceDiagram
+  participant Client
+  participant ActionSvc as Action Service
+  participant API as Leaderboard API
+  participant DB as PostgreSQL
+  participant Cache as Redis
+  participant Bus as Pub/Sub
+  participant RT as Realtime Gateway
 
-## Files changed / created
+  Client->>ActionSvc: Request Signed Action Token
+  ActionSvc-->>Client: SAT
+  Client->>API: POST /score-events (JWT, SAT, delta)
+  API->>API: Validate JWT, SAT, nonce
+  API->>DB: Insert event + update score (tx)
+  DB-->>API: Commit OK
+  API->>Cache: ZADD leaderboard
+  Cache-->>API: OK
+  API->>Cache: Get top10 snapshot
+  API->>API: Compute diff & version++
+  API->>Bus: Publish leaderboard.update
+  Bus-->>RT: Event
+  RT-->>Client: websocket message (leaderboard.update)
+```
 
-- `src/problem5/README.md` - This file: full specification, diagrams, and notes for the backend engineering team.
+## 19. Diagram: Data Model (ER)
 
-## Completion summary
+```mermaid
+erDiagram
+  USER ||--o{ SCORE_EVENT : has
+  USER ||--|| USER_SCORE : aggregates
+  USER_SCORE ||--o{ SCORE_EVENT : summarized-by
+  USER {
+    UUID id PK
+    string display_name
+  }
+  USER_SCORE {
+    UUID user_id PK FK
+    bigint score
+    timestamptz updated_at
+  }
+  SCORE_EVENT {
+    text id PK
+    UUID user_id FK
+    int delta
+    text action_type
+    text action_token_id
+    timestamptz created_at
+    timestamptz ingested_at
+    jsonb client_metadata
+  }
+```
 
-- Done: full API module spec document with endpoints, sequence and architecture diagrams, security, data model, and implementation guidance.
-- Next steps (optional): generate OpenAPI YAML, example server skeleton, and CI test matrix.
+## 20. Implementation Notes & Guidance
 
-## Security and anti-abuse
+- Use ULIDs for monotonic sortable IDs aiding pagination & time correlation.
+- Consider `SELECT ... FOR UPDATE` row locking on `user_scores` to avoid lost updates; or rely on atomic `UPDATE ... SET score = score + :delta` pattern.
+- Redis pipeline commands to minimize RTT (`ZADD`, `ZREVRANGE 0 9 WITHSCORES`, etc.).
+- Optimize diff computation by caching previous top10 array and doing positional comparison.
+- Provide a fallback polling mechanism: clients periodically call `GET /leaderboard/top` with `If-None-Match` if WebSocket disconnected.
+- Keep WebSocket message size small; optionally omit `full` field if client has version-1 diff chain length < threshold; force resync if chain too long.
 
-### Diagram Notes
+## 21. Risks & Mitigations
 
-Sequence diagram simplified for renderer compatibility:
+| Risk                               | Mitigation                                                                    |
+| ---------------------------------- | ----------------------------------------------------------------------------- |
+| SAT key leak                       | Rotate keys, scope to low privilege, immediate revocation list.               |
+| DB hotspot on updates              | Partition by user_id hash, or use sharded counters aggregated asynchronously. |
+| Large deltas break fairness        | Enforce `delta <= delta_cap` from SAT; clamp & log if exceeded.               |
+| Leaderboard churn flooding clients | Debounce publishes (e.g., 100ms window) & coalesce changes.                   |
+| Memory growth in Redis             | Periodic prune users with low scores & inactivity (optional).                 |
 
-- Removed unsupported 'rect' shading block and complex multiline notes.
-- Explicit idempotent duplicate branch returns before publish.
-- DB failure alt branch isolated; no side effects.
+## 22. Acceptance Criteria (Mapping Back to Request)
 
-Architecture diagram changes:
+- Top 10 retrieval defined (Section 7.2 #1, caching strategy Section 6).
+- Live updates defined (Sections 5, 7.3, diagrams 17-18).
+- Score increment path defined (Sections 8, 7.2 #3).
+- Security & anti-abuse strategies (Section 9, plus risks & mitigations Section 21).
+- Detailed architecture & data model specified (Sections 5-6, 19).
 
-- Removed embedded legend subgraph (some renderers choke on nested meta blocks).
-- Added minimal optional edge label and class styling only.
-- Broker node styled optional; Redis optional pub/sub path shown as dashed.
+## 23. Additional Improvement Suggestions
 
-Goals: Only authorized sources (the authenticated user or trusted internal services) can increment a score. Mitigate replay and forged increments.
-
-Recommendations:
-
-- Authentication: Use JWT (short-lived access tokens) for browser-authenticated users. For server-to-server, use mutual TLS or signed requests (HMAC) with rotating keys.
-- Authorization: Verify the user in the token matches the `userId` in the payload unless the caller is an internal trusted service.
-- Action deduplication: Include an `actionId` per user action and persist it (or keep a short-lived cache entry) to prevent replay. e.g., store recent actionIds in Redis SET with TTL.
-- Request integrity: When frontend cannot be fully trusted, require the action service (server-side) to call the API to claim the score (server-to-server). For web-only flows, require a signature computed server-side.
-- Rate limiting: Per-user and per-IP limits to slow down brute-force or automated score inflation.
-- Validation: limit `delta` to a reasonable range per action (e.g., 0 < delta <= 1000) and/or verify action metadata.
-- Audit logging: Log who requested the update, the delta, actionId, and verification outcome for investigations.
-
-Example anti-forgery flow (stronger):
-
-- User completes action -> frontend calls Action Service to validate action -> Action Service issues a short-lived claim token -> Frontend calls API with claim token -> API validates claim token server-to-server and applies delta.
-
-## Implementation guidance
-
-1. Input validation and auth early: Reject unauthenticated requests quickly.
-2. Deduplication: Check and record `actionId` atomically with score update to avoid double-applying.
-3. Atomic update pattern:
-   - In Postgres: UPDATE users_scores SET score = score + :delta, updated_at = now() WHERE user_id = :id; If row does not exist, INSERT ... ON CONFLICT DO UPDATE.
-   - Maintain Redis ZSET using ZINCRBY so reads are O(log(N)). Use a Redis LUA script for multi-step checks when needed.
-4. Publish after commit: Only publish update events after the DB commit succeeds.
-5. Broadcast: Keep WebSocket nodes stateless - use Redis pub/sub or a broker to fan-out messages. Each WS node listens and broadcasts to its connected clients.
-
-## Edge cases and how we handle them
-
-- Duplicate requests (replay): Use `actionId` dedupe with TTL and persist in DB or Redis.
-- High concurrency (many increments for same user): Use DB row-level locks or atomic Redis ZINCRBY and then sync back to DB or use optimistic increments with retry.
-- Partial failure between DB and Cache: Treat DB as source-of-truth. If cache update fails, schedule a retry job and return success to the caller once DB commit succeeded. Consider compensating job to reconcile cache.
-- Eventual consistency: Clients may see slight delays. Occasionally publish full snapshots to resync.
-- Missing user row: create on-demand with INSERT ... ON CONFLICT.
-
-## Observability and operational notes
-
-- Metrics to collect: requests/sec, auth failures, invalid payloads, DB errors, publish latency, number of WS connections, message delivery failures, top10 cache hit/miss.
-- Tracing: Add distributed tracing (e.g., OpenTelemetry) across API -> DB -> PubSub -> WS.
-- Logging: Structured logs include userId, actionId, delta, requestId, and outcome.
-
-## Testing guidance
-
-- Unit tests: payload validation, auth checks, dedupe logic, DB updater functions.
-- Integration tests: end-to-end tests simulating API update, Redis ZSET, pub/sub broadcast and WebSocket client receiving messages.
-- Load testing: simulate high frequency updates to validate atomicity and leaderboard correctness under concurrency.
-
-## Deployment and scaling
-
-- Scale API stateless workers behind a load balancer.
-- Use a central Redis (or Redis cluster) and ensure persistence or periodic snapshot to avoid data loss.
-- For persistence, Postgres scalable with partitioning if user base grows; maintain periodic reconciliation tasks to sync Redis <-> Postgres.
-
-## Open design decisions (to be resolved by the team)
-
-- Choice of primary read store for leaderboard: Redis ZSET (fast) vs materialized Postgres view (stronger durability). Recommended hybrid.
-- Broker choice: Redis Pub/Sub (simple) vs Redis Streams or Kafka (durable, replayable). For critical leaderboards and audit, prefer Streams/Kafka.
-
-## Additional improvements (recommended after initial implementation)
-
-- Add rate-limited admin endpoints for manual corrections with audit trails.
-- Use signed claim tokens from an action-validation service to close client-side forgery vectors.
-- Implement a per-action delta whitelist or rules engine to validate large deltas.
-- Introduce feature flags for graceful rollout of real-time features.
-- Provide a small SDK for frontends to standardize requests (including signature generation where applicable).
-- Add unit and integration tests in CI, and create a local dev docker-compose with Postgres + Redis + an example WS server for local testing.
-
-## Try-it (example requests)
-
-Example update call:
-
-    POST /api/score/update
-    Authorization: Bearer eyJhbGci...
-    Content-Type: application/json
-
-    {
-    	"userId": "u_123",
-    	"delta": 10,
-    	"actionId": "act-20251001-0001",
-    	"timestamp": "2025-10-01T12:00:00Z"
-    }
-
-Example websocket message (update):
-
-    {"type":"update","userId":"u_123","oldScore":12000,"newScore":12010,"oldRank":5,"newRank":3}
-
-## Acceptance criteria for handoff
-
-- API endpoints implemented and documented with OpenAPI/Swagger.
-- Unit and integration tests covering happy-path and 2 edge cases (dedupe and concurrent updates).
-- Real-time broadcaster that publishes to connected WS clients on score change.
-- Authentication and basic rate-limiting in place.
-
----
-
-If you'd like, I can also generate a minimal OpenAPI spec YAML and a tiny sequence-image export (PNG) for embedding in docs. I can also create example server skeleton code (Node.js/Express + Redis + Postgres) if the team wants a starter implementation.
+- Implement monotonic time source (NTP monitored) to prevent skew effects on SAT expiry.
+- Introduce circuit breaker on Redis failures to avoid cascading latency into API path.
+- Provide offline simulation harness to replay score event logs for fairness audits.
+- Expose admin endpoint for manual user adjustment with strict audit logging.
+- Add cryptographic transparency log (Merkle tree) for top10 history to increase trust (advanced feature).
